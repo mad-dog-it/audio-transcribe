@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Web interface for YouTube Transcriber."""
+"""Web interface for Audio Transcriber."""
 
 import json
 import os
 import re
 import sys
 import tempfile
+import urllib.request
 import warnings
 import webbrowser
 import threading
@@ -59,6 +60,55 @@ def get_api_key():
     """Get OpenAI API key from config file or environment."""
     config = load_config()
     return config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
+
+
+# ── Spotify Support ──────────────────────────────────────────────────────────
+
+SPOTIFY_PATTERN = re.compile(
+    r'open\.spotify\.com/episode/([a-zA-Z0-9]+)'
+)
+
+
+def is_spotify_url(url):
+    """Check if a URL is a Spotify episode link."""
+    return bool(SPOTIFY_PATTERN.search(url))
+
+
+def extract_spotify_id(url):
+    """Extract Spotify episode ID from a URL."""
+    m = SPOTIFY_PATTERN.search(url)
+    return m.group(1) if m else None
+
+
+def get_spotify_metadata(episode_id):
+    """Fetch episode title and thumbnail from Spotify's free oEmbed API."""
+    oembed_url = f"https://open.spotify.com/oembed?url=https://open.spotify.com/episode/{episode_id}"
+    try:
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return {
+                "title": data.get("title", ""),
+                "thumbnail_url": data.get("thumbnail_url", ""),
+            }
+    except Exception:
+        return {"title": "", "thumbnail_url": ""}
+
+
+def find_youtube_match(search_query):
+    """Search YouTube for a video matching the query. Returns (video_id, title) or (None, None)."""
+    if not yt_dlp:
+        return None, None
+    try:
+        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch3:{search_query}", download=False)
+            if info and "entries" in info and info["entries"]:
+                best = info["entries"][0]
+                return best.get("id"), best.get("title", "")
+    except Exception:
+        pass
+    return None, None
 
 
 # ── Speaker Labels ───────────────────────────────────────────────────────────
@@ -121,7 +171,7 @@ HTML_PAGE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YouTube Transcriber</title>
+    <title>Audio Transcriber</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -594,6 +644,15 @@ HTML_PAGE = """
         .video-info img { width: 80px; border-radius: 6px; }
         .video-info .title { font-size: 14px; color: #ccc; }
 
+        .spotify-note {
+            font-size: 12px;
+            color: #1db954;
+            padding: 6px 16px;
+            background: #1a2a1a;
+            border-radius: 6px;
+            margin-top: 6px;
+        }
+
         /* ── Paste Workaround (shown when YouTube blocks) ── */
 
         .paste-workaround {
@@ -1023,6 +1082,69 @@ HTML_PAGE = """
 
         .batch-result-link:hover { background: #2a2a3a; }
 
+        .upload-divider {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 16px 0 12px;
+            color: #555;
+            font-size: 13px;
+        }
+        .upload-divider::before, .upload-divider::after {
+            content: '';
+            flex: 1;
+            border-top: 1px solid #333;
+        }
+
+        .upload-zone {
+            border: 2px dashed #333;
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            color: #777;
+            font-size: 14px;
+        }
+        .upload-zone:hover {
+            border-color: #555;
+            background: #1a1a1a;
+        }
+        .upload-zone.dragover {
+            border-color: #5eb5f7;
+            background: #1a1a2a;
+            color: #5eb5f7;
+        }
+        .upload-zone .upload-icon {
+            font-size: 28px;
+            display: block;
+            margin-bottom: 8px;
+        }
+        .upload-zone .upload-hint {
+            font-size: 12px;
+            color: #555;
+            margin-top: 6px;
+        }
+        .upload-file-name {
+            display: none;
+            margin-top: 8px;
+            padding: 8px 14px;
+            background: #1a2a1a;
+            border: 1px solid #2a4a2a;
+            border-radius: 8px;
+            color: #8ef09e;
+            font-size: 13px;
+        }
+        .upload-file-name.visible { display: flex; align-items: center; justify-content: space-between; }
+        .upload-file-name .remove-file {
+            background: none;
+            border: none;
+            color: #f09e8e;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 0 4px;
+        }
+
         .batch-tabs {
             display: none;
             gap: 0;
@@ -1174,22 +1296,34 @@ HTML_PAGE = """
 <body>
     <div class="container">
         <header>
-            <h1><span class="play">&#9654;</span> YouTube Transcriber</h1>
-            <p>Paste a YouTube link, get the transcript</p>
+            <h1><span class="play">&#127911;</span> Audio Transcriber</h1>
+            <p>Paste a YouTube or Spotify link, or upload an audio file</p>
             <button class="settings-btn" id="settingsBtn" onclick="openSettings()">&#9881; Settings</button>
         </header>
 
         <div class="input-group">
-            <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." autofocus>
+            <input type="text" id="url" placeholder="YouTube or Spotify episode link..." autofocus>
             <button class="btn-primary" id="goBtn" onclick="transcribe()">Transcribe</button>
         </div>
         <button class="batch-toggle" id="batchToggle" onclick="toggleBatchMode()">&#43; Multiple URLs</button>
         <div class="batch-area" id="batchArea">
-            <textarea id="batchUrls" placeholder="Paste one YouTube URL per line..."></textarea>
+            <textarea id="batchUrls" placeholder="Paste one URL per line (YouTube or Spotify)..."></textarea>
             <div class="batch-hint">One URL per line. They'll be transcribed one at a time.</div>
             <button class="btn-primary" id="batchGoBtn" onclick="startBatch()" style="width:100%;margin-top:8px;">Transcribe all</button>
             <div class="batch-progress" id="batchProgress"></div>
             <div class="batch-results-list" id="batchResults"></div>
+        </div>
+
+        <div class="upload-divider">or upload a file</div>
+        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+            <span class="upload-icon">&#127908;</span>
+            Drop an audio file here, or click to browse
+            <div class="upload-hint">MP3, M4A, WAV, MP4, WEBM (max 25 MB)</div>
+        </div>
+        <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.mp4,.webm,.mpeg,.mpga" style="display:none" onchange="handleFileSelect(this)">
+        <div class="upload-file-name" id="uploadFileName">
+            <span id="uploadFileLabel"></span>
+            <button class="remove-file" onclick="clearUploadedFile()">&times;</button>
         </div>
 
         <div class="options">
@@ -1238,6 +1372,7 @@ HTML_PAGE = """
             <img id="thumbnail" src="" alt="">
             <span class="title" id="videoTitle"></span>
         </div>
+        <div class="spotify-note" id="spotifyNote" style="display:none"></div>
 
         <div class="status" id="status">
             <div class="spinner"></div>
@@ -1320,7 +1455,7 @@ HTML_PAGE = """
         </div>
 
         <footer>
-            Transcripts from YouTube captions &bull; AI features powered by OpenAI
+            YouTube &bull; Spotify &bull; Audio files &bull; AI powered by OpenAI
         </footer>
     </div>
 
@@ -1538,6 +1673,10 @@ HTML_PAGE = """
         }
 
         async function transcribe() {
+            // If a file is uploaded, transcribe that instead
+            if (uploadedFile) {
+                return transcribeFile();
+            }
             const url = urlInput.value.trim();
             if (!url) { urlInput.focus(); return; }
 
@@ -1595,6 +1734,14 @@ HTML_PAGE = """
                 originalData = { transcript: data.transcript, speakers: data.speakers || [], source: data.source };
                 currentVideoId = data.video_id || '';
                 currentTimestamps = data.timestamps || [];
+
+                // Show Spotify match notice if applicable
+                if (data.spotify_match) {
+                    document.getElementById('spotifyNote').textContent = 'Transcribed via YouTube match: ' + data.spotify_match;
+                    document.getElementById('spotifyNote').style.display = 'block';
+                } else {
+                    document.getElementById('spotifyNote').style.display = 'none';
+                }
 
                 // If AI cleanup is OFF, just show raw captions and stop
                 if (!doCleanup) {
@@ -1787,10 +1934,30 @@ HTML_PAGE = """
         }
 
         function showThumbnail(url) {
-            const match = url.match(/(?:v=|youtu\\.be\\/|shorts\\/)([a-zA-Z0-9_-]{11})/);
-            if (match) {
-                document.getElementById('thumbnail').src = 'https://img.youtube.com/vi/' + match[1] + '/mqdefault.jpg';
+            const ytMatch = url.match(/(?:v=|youtu\\.be\\/|shorts\\/)([a-zA-Z0-9_-]{11})/);
+            if (ytMatch) {
+                document.getElementById('thumbnail').src = 'https://img.youtube.com/vi/' + ytMatch[1] + '/mqdefault.jpg';
                 document.getElementById('videoInfo').style.display = 'flex';
+                return;
+            }
+            // Spotify episode — fetch thumbnail from oEmbed via our metadata endpoint
+            if (url.indexOf('spotify.com/episode') >= 0) {
+                fetch('/metadata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.title) {
+                        document.getElementById('videoTitle').textContent = data.title;
+                        if (data.thumbnail_url) {
+                            document.getElementById('thumbnail').src = data.thumbnail_url;
+                        }
+                        document.getElementById('videoInfo').style.display = 'flex';
+                    }
+                })
+                .catch(function() {});
             }
         }
 
@@ -1947,6 +2114,159 @@ HTML_PAGE = """
                 renderTranscript(originalData.transcript, originalData.speakers);
                 showSpeakerRenameBar(originalData.speakers);
             }
+        }
+
+        // ── File upload ──
+
+        let uploadedFile = null;
+
+        // Drag and drop
+        const uploadZone = document.getElementById('uploadZone');
+        uploadZone.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+        uploadZone.addEventListener('dragleave', function() {
+            uploadZone.classList.remove('dragover');
+        });
+        uploadZone.addEventListener('drop', function(e) {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                setUploadedFile(e.dataTransfer.files[0]);
+            }
+        });
+
+        function handleFileSelect(input) {
+            if (input.files.length > 0) {
+                setUploadedFile(input.files[0]);
+            }
+        }
+
+        function setUploadedFile(file) {
+            const maxSize = 25 * 1024 * 1024;
+            if (file.size > maxSize) {
+                document.getElementById('error').textContent = 'File is too large (max 25 MB for Whisper).';
+                document.getElementById('error').style.display = 'block';
+                return;
+            }
+            uploadedFile = file;
+            document.getElementById('uploadFileLabel').textContent = file.name + ' (' + (file.size / (1024 * 1024)).toFixed(1) + ' MB)';
+            document.getElementById('uploadFileName').classList.add('visible');
+            document.getElementById('uploadZone').style.display = 'none';
+        }
+
+        function clearUploadedFile() {
+            uploadedFile = null;
+            document.getElementById('fileInput').value = '';
+            document.getElementById('uploadFileName').classList.remove('visible');
+            document.getElementById('uploadZone').style.display = '';
+        }
+
+        async function transcribeFile() {
+            if (!uploadedFile) return;
+
+            const doCleanup = document.getElementById('aiCleanup').checked;
+            const speakerNames = document.getElementById('speakerNames').value.trim();
+
+            // Reset state
+            originalData = null;
+            cleanedData = null;
+            showingCleaned = false;
+            videoMeta = { title: uploadedFile.name, channel: '', description: '' };
+            document.getElementById('originalBtn').style.display = 'none';
+            document.getElementById('pasteWorkaround').style.display = 'none';
+            document.getElementById('speakerRenameBar').classList.remove('visible');
+            document.getElementById('batchTabs').classList.remove('visible');
+            document.getElementById('batchTabs').innerHTML = '';
+            hideSummary();
+
+            // Show loading
+            document.getElementById('status').style.display = 'block';
+            document.getElementById('statusText').textContent = 'Uploading and transcribing with Whisper...';
+            document.getElementById('result').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('goBtn').disabled = true;
+
+            document.getElementById('videoTitle').textContent = uploadedFile.name;
+            document.getElementById('thumbnail').src = '';
+            document.getElementById('videoInfo').style.display = 'none';
+
+            try {
+                const formData = new FormData();
+                formData.append('file', uploadedFile);
+
+                const resp = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await resp.json();
+
+                if (data.error) {
+                    document.getElementById('status').style.display = 'none';
+                    document.getElementById('error').textContent = data.error;
+                    document.getElementById('error').style.display = 'block';
+                    document.getElementById('goBtn').disabled = false;
+                    return;
+                }
+
+                originalData = { transcript: data.transcript, speakers: data.speakers || [], source: 'whisper' };
+                currentVideoId = '';
+                currentTimestamps = [];
+
+                if (!doCleanup) {
+                    document.getElementById('status').style.display = 'none';
+                    renderTranscript(data.transcript, data.speakers || []);
+                    document.getElementById('resultTitle').innerHTML = 'Transcript (from Whisper)';
+                    document.getElementById('result').style.display = 'block';
+                    saveToHistory(uploadedFile.name, data.transcript, data.speakers || [], '');
+                    document.getElementById('goBtn').disabled = false;
+                    return;
+                }
+
+                // AI cleanup
+                document.getElementById('statusText').textContent = 'Cleaning up with AI...';
+
+                const cleanResp = await fetch('/cleanup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        transcript: data.transcript,
+                        speaker_names: speakerNames,
+                        video_title: uploadedFile.name,
+                        video_channel: '',
+                        video_description: ''
+                    })
+                });
+
+                const cleanData = await cleanResp.json();
+                document.getElementById('status').style.display = 'none';
+
+                if (cleanData.error) {
+                    renderTranscript(data.transcript, data.speakers || []);
+                    document.getElementById('resultTitle').innerHTML = 'Transcript (from Whisper)';
+                    document.getElementById('result').style.display = 'block';
+                    document.getElementById('error').textContent = 'AI cleanup failed: ' + cleanData.error;
+                    document.getElementById('error').style.display = 'block';
+                } else {
+                    cleanedData = { transcript: cleanData.transcript, speakers: cleanData.speakers || [], summary: cleanData.summary || '' };
+                    showingCleaned = true;
+                    showSummary(cleanData.summary || '');
+                    renderTranscript(cleanData.transcript, cleanData.speakers || []);
+                    document.getElementById('resultTitle').innerHTML =
+                        'Transcript <span class="ai-badge">&#10024; Cleaned with AI</span>';
+                    document.getElementById('result').style.display = 'block';
+
+                    const origBtn = document.getElementById('originalBtn');
+                    origBtn.style.display = 'inline-block';
+                    origBtn.innerHTML = '&#8617; Show raw transcript';
+
+                    saveToHistory(uploadedFile.name, cleanData.transcript, cleanData.speakers || [], cleanData.summary || '', uploadedFile.name);
+                }
+            } catch (err) {
+                document.getElementById('status').style.display = 'none';
+                document.getElementById('error').textContent = 'Upload failed. Is the server still running?';
+                document.getElementById('error').style.display = 'block';
+            }
+
+            document.getElementById('goBtn').disabled = false;
         }
 
         // ── Download menu ──
@@ -2578,12 +2898,38 @@ def transcribe():
     label_speakers = data.get("speakers", False)
 
     if not url:
-        return jsonify({"error": "Please enter a YouTube URL."})
+        return jsonify({"error": "Please enter a YouTube or Spotify episode URL."})
+
+    # ── Spotify episode handling ──
+    if is_spotify_url(url):
+        spotify_id = extract_spotify_id(url)
+        if not spotify_id:
+            return jsonify({"error": "Couldn't read that Spotify link. Try copying it again."})
+
+        meta = get_spotify_metadata(spotify_id)
+        if not meta["title"]:
+            return jsonify({"error": "Couldn't fetch episode info from Spotify."})
+
+        # Search YouTube for a matching video
+        yt_id, yt_title = find_youtube_match(meta["title"])
+        if not yt_id:
+            return jsonify({
+                "error": f"Couldn't find \"{meta['title']}\" on YouTube. "
+                         "This episode may not be available there. "
+                         "Try pasting the YouTube link directly if you can find it."
+            })
+
+        # Redirect to the normal YouTube flow with the found video ID
+        url = f"https://www.youtube.com/watch?v={yt_id}"
+        spotify_match = yt_title or meta["title"]
+        # Fall through to normal YouTube transcription below
+    else:
+        spotify_match = None
 
     try:
         video_id = extract_video_id(url)
     except SystemExit:
-        return jsonify({"error": "That doesn't look like a valid YouTube URL."})
+        return jsonify({"error": "That doesn't look like a valid YouTube or Spotify URL."})
 
     # Try captions first
     try:
@@ -2612,10 +2958,13 @@ def transcribe():
         except Exception:
             pass  # Timestamps are optional — don't fail the request
 
-        return jsonify({
+        resp = {
             "transcript": transcript, "source": "captions",
             "speakers": speakers, "timestamps": timestamps, "video_id": video_id
-        })
+        }
+        if spotify_match:
+            resp["spotify_match"] = spotify_match
+        return jsonify(resp)
 
     # Try Whisper fallback if API key is available
     api_key = get_api_key()
@@ -2688,6 +3037,55 @@ def transcribe():
     })
 
 
+@app.route("/upload", methods=["POST"])
+def upload_audio():
+    """Transcribe an uploaded audio file using Whisper."""
+    api_key = get_api_key()
+    if not api_key:
+        return jsonify({"error": "Please add your OpenAI API key in Settings first."})
+
+    if openai is None:
+        return jsonify({"error": "OpenAI package not installed. Run: pip3 install openai"})
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."})
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected."})
+
+    # Check file size (25 MB limit for Whisper)
+    file.seek(0, 2)
+    size = file.tell()
+    file.seek(0)
+    if size > 25 * 1024 * 1024:
+        return jsonify({"error": f"File is {size / (1024*1024):.0f} MB (max 25 MB for Whisper)."})
+
+    # Save to temp file and send to Whisper
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename)[1], delete=False) as tmp:
+            file.save(tmp)
+            tmp_path = tmp.name
+
+        try:
+            with open(tmp_path, "rb") as f:
+                result = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="text",
+                )
+
+            transcript = result if isinstance(result, str) else result.text
+            return jsonify({"transcript": transcript, "source": "whisper", "speakers": []})
+        finally:
+            os.unlink(tmp_path)
+
+    except Exception as e:
+        error_msg = str(e)[:200]
+        return jsonify({"error": f"Whisper transcription failed: {error_msg}"})
+
+
 @app.route("/metadata", methods=["POST"])
 def metadata():
     """Fetch video title, channel name, and description from YouTube."""
@@ -2697,6 +3095,19 @@ def metadata():
     data = request.get_json()
     url = data.get("url", "").strip()
     if not url:
+        return jsonify({"title": "", "channel": "", "description": ""})
+
+    # Handle Spotify URLs — use oEmbed for metadata
+    if is_spotify_url(url):
+        spotify_id = extract_spotify_id(url)
+        if spotify_id:
+            meta = get_spotify_metadata(spotify_id)
+            return jsonify({
+                "title": meta.get("title", ""),
+                "channel": "Spotify",
+                "description": "",
+                "thumbnail_url": meta.get("thumbnail_url", ""),
+            })
         return jsonify({"title": "", "channel": "", "description": ""})
 
     try:
@@ -2838,7 +3249,7 @@ def cleanup():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("\n  YouTube Transcriber is running!")
+    print("\n  Audio Transcriber is running!")
     print("  Open your browser to: http://localhost:8080\n")
 
     threading.Timer(1.5, lambda: webbrowser.open("http://localhost:8080")).start()
